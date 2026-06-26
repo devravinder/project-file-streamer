@@ -58,6 +58,46 @@ const server = http.createServer((req, res) => {
     res.end();
     return;
   }
+  //==
+
+  const url = new URL(req.url!, `http://localhost:${PORT}`);
+
+  // Returns JSON list of all files recursively
+  if (url.pathname === "/api/list") {
+    const files = getAllFiles(OUTPUT_DIR).map((f) =>
+      path.relative(OUTPUT_DIR, f)
+    );
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(files));
+    return;
+  }
+
+  // Streams a single encrypted file
+  if (url.pathname === "/api/download") {
+    const filePath = decodeURIComponent(url.searchParams.get("path") ?? "");
+    const safePath = path.normalize(filePath).replace(/^(\.\.(\/|\\|$))+/, "");
+    const absPath = path.join(OUTPUT_DIR, safePath);
+
+    if (!fs.existsSync(absPath)) {
+      res.writeHead(404);
+      res.end("Not found");
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "application/octet-stream" });
+
+    let byteOffset = 0;
+    const readStream = fs.createReadStream(absPath);
+    readStream.on("data", (chunk: Buffer) => {
+      const encrypted = xorChunk(chunk, byteOffset);
+      byteOffset += chunk.length;
+      res.write(encrypted);
+    });
+    readStream.on("end", () => res.end());
+    return;
+  }
+
+  //===
 
   res.writeHead(404);
   res.end();
@@ -72,8 +112,10 @@ const wss = new WebSocketServer({
   },
 });
 
+const HANDSHAKE = "FILE_STREAMER_HANDSHAKE";
 wss.on("connection", (ws: WebSocket) => {
   console.log("Client connected");
+  let verified = false;
 
   let writeStream: fs.WriteStream | null = null;
   let byteOffset = 0;
@@ -81,6 +123,23 @@ wss.on("connection", (ws: WebSocket) => {
   let expectingFileChunks = false;
 
   ws.on("message", (data: Buffer) => {
+
+    if (!verified) {
+      console.log("Veryfing...")
+      try {
+        const decrypted = xorText(data).toString("utf8");
+        if (decrypted !== HANDSHAKE) throw new Error("Bad key");
+        verified = true;
+        console.log("verification success")
+        ws.send(xorText(Buffer.from(JSON.stringify({ type: "handshake", ok: true }))));
+      } catch {
+        console.log("verification failed")
+        ws.send(Buffer.from(JSON.stringify({ type: "handshake", ok: false }))); // plain — client may have wrong key
+        // ws.close();
+      }
+      return;
+    }
+
     // Try control message first (file | end)
     const control = tryParseControl(data);
 
@@ -134,3 +193,13 @@ server.listen(PORT, () => {
   console.log(`🚀 Server on http://localhost:${PORT}`);
   console.log(`📂 Output: ${OUTPUT_DIR}`);
 });
+
+//===
+function getAllFiles(dir: string): string[] {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  return entries.flatMap((e) =>
+    e.isDirectory()
+      ? getAllFiles(path.join(dir, e.name))
+      : [path.join(dir, e.name)]
+  );
+}

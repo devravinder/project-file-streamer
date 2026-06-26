@@ -30,7 +30,15 @@ function waitForMessage(ws: WebSocket, key: Uint8Array): Promise<unknown> {
         const buffer = await (e.data as Blob).arrayBuffer();
         const decrypted = xorChunk(new Uint8Array(buffer), key, 0);
         const text = new TextDecoder().decode(decrypted);
-        resolve(JSON.parse(text));
+        try{
+          resolve(JSON.parse(text))
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        }catch(_){
+             // if invalid key....plain message
+             const text = new TextDecoder().decode(new Uint8Array(buffer));
+             resolve(JSON.parse(text))
+        }
+        ;
       },
       { once: true }
     );
@@ -39,6 +47,7 @@ function waitForMessage(ws: WebSocket, key: Uint8Array): Promise<unknown> {
     });
   });
 }
+const HANDSHAKE = "FILE_STREAMER_HANDSHAKE";
 
 export async function streamFiles(
   fileList: FileList,
@@ -56,6 +65,12 @@ export async function streamFiles(
     ws.addEventListener("open", () => resolve(), { once: true });
     ws.addEventListener("error", () => reject(new Error("Cannot connect to server")), { once: true });
   });
+
+    // ── Verify key ──
+  ws.send(encryptText(HANDSHAKE, key));
+  const ack = await waitForMessage(ws, key) as { type: string; ok: boolean };
+  if (!ack.ok) throw new Error("Invalid secret key"); // caught in App.tsx → shows error
+  // ────────────────
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
@@ -83,5 +98,43 @@ export async function streamFiles(
   }
 
   ws.close();
+  onProgress(files.length, files.length, "");
+}
+
+//===
+export async function downloadFiles(
+  secret: string,
+  onProgress: (done: number, total: number, current: string) => void
+): Promise<void> {
+  const key = await deriveKey(secret);
+
+  // 1. Fetch file list
+  const res = await fetch("/api/list");
+  const files: string[] = await res.json();
+
+  for (let i = 0; i < files.length; i++) {
+    const filePath = files[i];
+    onProgress(i, files.length, filePath);
+
+    // 2. Download encrypted file
+    const r = await fetch(`/api/download?path=${encodeURIComponent(filePath)}`);
+    const buffer = await r.arrayBuffer();
+
+    // 3. Decrypt
+    const decrypted = xorChunk(new Uint8Array(buffer), key, 0);
+
+    // 4. Save with folder structure using File System Access API
+    const parts = filePath.split(/[\\/]/);
+    const blob = new Blob([decrypted as unknown as ArrayBuffer]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = parts[parts.length - 1]; // browser only saves flat — see note
+    a.click();
+    URL.revokeObjectURL(url);
+
+    await new Promise((r) => setTimeout(r, 100)); // small delay between downloads
+  }
+
   onProgress(files.length, files.length, "");
 }
