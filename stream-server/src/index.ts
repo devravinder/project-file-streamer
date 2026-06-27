@@ -1,30 +1,30 @@
-import http   from "node:http";
-import fs     from "node:fs";
-import path   from "node:path";
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
 import crypto from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const PORT       = process.env.PORT       ?? 3001;
+const PORT = process.env.PORT ?? 3001;
 const OUTPUT_DIR = path.resolve(process.env.OUTPUT_DIR ?? "../data");
-const SECRET     = process.env.SECRET     ?? "my-default-secret";
+const SECRET = process.env.SECRET ?? "my-default-secret";
 
 // ─── Frame prefix bytes (mirror client) ──────────────────────────────────────
 const FRAME = { PLAIN: 0x00, CTRL: 0x01, CHUNK: 0x02 } as const;
 
 // ─── Event types ──────────────────────────────────────────────────────────────
 const EV = {
-  HANDSHAKE:           "HANDSHAKE",
-  HANDSHAKE_ACK:       "HANDSHAKE_ACK",
-  LIST_FILES:          "LIST_FILES",
-  FILES_LIST:          "FILES_LIST",
-  UPLOAD_FILE_START:   "UPLOAD_FILE_START",
-  UPLOAD_FILE_END:     "UPLOAD_FILE_END",
-  UPLOAD_FILE_ACK:     "UPLOAD_FILE_ACK",
-  DOWNLOAD_FILE:       "DOWNLOAD_FILE",
+  HANDSHAKE: "HANDSHAKE",
+  HANDSHAKE_ACK: "HANDSHAKE_ACK",
+  LIST_FILES: "LIST_FILES",
+  FILES_LIST: "FILES_LIST",
+  UPLOAD_FILE_START: "UPLOAD_FILE_START",
+  UPLOAD_FILE_END: "UPLOAD_FILE_END",
+  UPLOAD_FILE_ACK: "UPLOAD_FILE_ACK",
+  DOWNLOAD_FILE: "DOWNLOAD_FILE",
   DOWNLOAD_FILE_START: "DOWNLOAD_FILE_START",
-  DOWNLOAD_FILE_END:   "DOWNLOAD_FILE_END",
-  ERROR:               "ERROR",
+  DOWNLOAD_FILE_END: "DOWNLOAD_FILE_END",
+  ERROR: "ERROR",
 } as const;
 
 // ─── Crypto ───────────────────────────────────────────────────────────────────
@@ -44,14 +44,14 @@ function xor(data: Buffer, key: Buffer, offset = 0): Buffer {
 // ─── Frame builders ───────────────────────────────────────────────────────────
 function ctrlFrame(obj: object, key: Buffer): Buffer {
   const json = Buffer.from(JSON.stringify(obj));
-  const enc  = xor(json, key, 0);
+  const enc = xor(json, key, 0);
   return Buffer.concat([Buffer.from([FRAME.CTRL]), enc]);
 }
 
 function chunkFrame(data: Buffer, key: Buffer, offset: number): Buffer {
-  const enc    = xor(data, key, offset);
+  const enc = xor(data, key, offset);
   const header = Buffer.alloc(5);
-  header[0]    = FRAME.CHUNK;
+  header[0] = FRAME.CHUNK;
   header.writeUInt32BE(offset, 1);
   return Buffer.concat([header, enc]);
 }
@@ -63,7 +63,7 @@ function plainFrame(obj: object): Buffer {
 }
 
 function decodeCtrl<T>(buf: Buffer, key: Buffer): T {
-  const enc = buf.subarray(1);            // skip prefix
+  const enc = buf.subarray(1); // skip prefix
   const dec = xor(enc, key, 0);
   return JSON.parse(dec.toString("utf8")) as T;
 }
@@ -77,32 +77,93 @@ function safePath(p: string): string {
 
 function getAllFiles(dir: string): string[] {
   if (!fs.existsSync(dir)) return [];
-  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
-    e.isDirectory()
-      ? getAllFiles(path.join(dir, e.name))
-      : [path.join(dir, e.name)]
-  );
+  return fs
+    .readdirSync(dir, { withFileTypes: true })
+    .flatMap((e) =>
+      e.isDirectory()
+        ? getAllFiles(path.join(dir, e.name))
+        : [path.join(dir, e.name)],
+    );
+}
+
+const CLIENT_DIST = path.resolve("../stream-clinet/dist");
+const isClientExist = fs.existsSync(CLIENT_DIST);
+if (isClientExist) {
+  console.log("📦 Serving client from:", CLIENT_DIST);
 }
 
 // ─── HTTP → WS upgrade only ───────────────────────────────────────────────────
-const server = http.createServer((_req, res) => {
-  res.setHeader("Access-Control-Allow-Origin",  "*");
+const server = http.createServer((req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+
+  // Handle preflight first — before anything else
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  //================== to serve static files =============== start
+  if (isClientExist) {
+    const url = req.url ?? "/";
+
+    // WebSocket upgrade requests skip this handler entirely (handled by ws)
+    // Serve static files from client/dist
+    const MIME: Record<string, string> = {
+      ".html": "text/html",
+      ".js": "application/javascript",
+      ".css": "text/css",
+      ".svg": "image/svg+xml",
+      ".png": "image/png",
+      ".ico": "image/x-icon",
+      ".json": "application/json",
+      ".woff2": "font/woff2",
+    };
+
+    // Resolve file path — strip query string
+    const urlPath = url.split("?")[0]!;
+    const filePath = path.join(CLIENT_DIST, urlPath);
+    const ext = path.extname(filePath);
+    const mimeType = MIME[ext] ?? "application/octet-stream";
+
+    // Serve the file if it exists
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+      res.writeHead(200, { "Content-Type": mimeType });
+      fs.createReadStream(filePath).pipe(res);
+      return;
+    }
+
+    // SPA fallback — all unknown routes → index.html (React Router handles it)
+    const indexPath = path.join(CLIENT_DIST, "index.html");
+    if (fs.existsSync(indexPath)) {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      fs.createReadStream(indexPath).pipe(res);
+      return;
+    }
+  }
+
+  //============= end
+
   res.writeHead(426, "WebSocket only");
   res.end("WebSocket only");
 });
 
 // ─── WebSocket server ─────────────────────────────────────────────────────────
-const wss = new WebSocketServer({ server, path: "/ws", verifyClient: (_i, cb) => cb(true) });
+const wss = new WebSocketServer({
+  server,
+  path: "/ws",
+  verifyClient: (_i, cb) => cb(true),
+});
 
 wss.on("connection", (ws: WebSocket) => {
   console.log("⚡ Client connected");
 
-  let clientKey:   Buffer | null          = null;
-  let writeStream: fs.WriteStream | null  = null;
+  let clientKey: Buffer | null = null;
+  let writeStream: fs.WriteStream | null = null;
   let uploadByteOffset = 0;
-  let currentPath      = "";
+  let currentPath = "";
 
   function send(obj: object) {
     if (!clientKey) return;
@@ -115,13 +176,25 @@ wss.on("connection", (ws: WebSocket) => {
     // ── Handshake (before auth) ───────────────────────────────────────────
     if (!clientKey) {
       if (prefix !== FRAME.CTRL) {
-        ws.send(plainFrame({ type: EV.HANDSHAKE_ACK, ok: false, message: "Expected handshake" }));
+        ws.send(
+          plainFrame({
+            type: EV.HANDSHAKE_ACK,
+            ok: false,
+            message: "Expected handshake",
+          }),
+        );
         ws.close();
         return;
       }
       try {
-        const msg = decodeCtrl<{ type: string; token: string }>(raw, SERVER_KEY);
-        if (msg.type !== EV.HANDSHAKE || msg.token !== "FILE_STREAMER_HANDSHAKE") {
+        const msg = decodeCtrl<{ type: string; token: string }>(
+          raw,
+          SERVER_KEY,
+        );
+        if (
+          msg.type !== EV.HANDSHAKE ||
+          msg.token !== "FILE_STREAMER_HANDSHAKE"
+        ) {
           throw new Error("Bad token");
         }
         clientKey = SERVER_KEY;
@@ -131,7 +204,13 @@ wss.on("connection", (ws: WebSocket) => {
       } catch {
         console.log("❌ Handshake failed — wrong key");
         // Send PLAIN ack — client's key was wrong so it can't decrypt; we send plain
-        ws.send(plainFrame({ type: EV.HANDSHAKE_ACK, ok: false, message: "Invalid secret key" }));
+        ws.send(
+          plainFrame({
+            type: EV.HANDSHAKE_ACK,
+            ok: false,
+            message: "Invalid secret key",
+          }),
+        );
         ws.close();
       }
       return;
@@ -140,8 +219,8 @@ wss.on("connection", (ws: WebSocket) => {
     // ── Binary chunk (upload) ─────────────────────────────────────────────
     if (prefix === FRAME.CHUNK) {
       if (!writeStream) return;
-      const offset    = raw.readUInt32BE(1);     // bytes 1-4
-      const encData   = raw.subarray(5);         // byte 5+
+      const offset = raw.readUInt32BE(1); // bytes 1-4
+      const encData = raw.subarray(5); // byte 5+
       const decrypted = xor(encData, clientKey, offset);
       uploadByteOffset += decrypted.length;
       writeStream.write(decrypted);
@@ -160,21 +239,21 @@ wss.on("connection", (ws: WebSocket) => {
     }
 
     switch (msg.type) {
-
       case EV.LIST_FILES: {
-        const files = getAllFiles(OUTPUT_DIR)
-          .map((f) => path.relative(OUTPUT_DIR, f).replace(/\\/g, "/"));
+        const files = getAllFiles(OUTPUT_DIR).map((f) =>
+          path.relative(OUTPUT_DIR, f).replace(/\\/g, "/"),
+        );
         send({ type: EV.FILES_LIST, files });
         break;
       }
 
       case EV.UPLOAD_FILE_START: {
-        const sp   = safePath(msg.path ?? "unknown");
+        const sp = safePath(msg.path ?? "unknown");
         const dest = path.join(OUTPUT_DIR, sp);
         fs.mkdirSync(path.dirname(dest), { recursive: true });
-        writeStream      = fs.createWriteStream(dest);
+        writeStream = fs.createWriteStream(dest);
         uploadByteOffset = 0;
-        currentPath      = sp;
+        currentPath = sp;
         console.log(`⬆  Receiving: ${sp}`);
         break;
       }
@@ -192,7 +271,7 @@ wss.on("connection", (ws: WebSocket) => {
       }
 
       case EV.DOWNLOAD_FILE: {
-        const sp      = safePath(msg.path ?? "");
+        const sp = safePath(msg.path ?? "");
         const absPath = path.join(OUTPUT_DIR, sp);
 
         if (!fs.existsSync(absPath)) {
@@ -211,15 +290,24 @@ wss.on("connection", (ws: WebSocket) => {
           ws.send(chunkFrame(chunk, clientKey!, dlOffset));
           dlOffset += chunk.length;
         });
-        stream.on("end",   () => { send({ type: EV.DOWNLOAD_FILE_END, path: sp }); console.log(`⬇  Sent: ${sp}`); });
+        stream.on("end", () => {
+          send({ type: EV.DOWNLOAD_FILE_END, path: sp });
+          console.log(`⬇  Sent: ${sp}`);
+        });
         stream.on("error", (e) => send({ type: EV.ERROR, message: e.message }));
         break;
       }
     }
   });
 
-  ws.on("close", () => { writeStream?.destroy(); console.log("🔌 Disconnected"); });
-  ws.on("error", (e) => { console.error("WS error:", e.message); writeStream?.destroy(); });
+  ws.on("close", () => {
+    writeStream?.destroy();
+    console.log("🔌 Disconnected");
+  });
+  ws.on("error", (e) => {
+    console.error("WS error:", e.message);
+    writeStream?.destroy();
+  });
 });
 
 server.listen(PORT, () => {

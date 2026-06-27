@@ -1,16 +1,16 @@
 # File Streamer
 
-A encrypted file streaming app — select a folder or files in the browser, and they stream directly to the server over WebSocket, encrypted end-to-end. No plain text ever leaves the client.
+Stream files from browser to server (and back) over WebSocket — fully encrypted end-to-end. No plain text ever crosses the wire.
 
 ---
 
 ## Stack
 
 | Side | Tech |
-|---|---|
+| --- | --- |
 | Client | React + TypeScript (Vite) |
 | Server | Node.js + TypeScript (`ws`) |
-| Transport | WebSocket |
+| Transport | WebSocket only |
 | Encryption | XOR cipher with SHA-256 derived key |
 
 ---
@@ -19,15 +19,11 @@ A encrypted file streaming app — select a folder or files in the browser, and 
 
 ### 1. Key Derivation
 
-Both client and server independently derive the same 32-byte key from the shared secret. They never exchange the key over the wire.
+Both sides independently derive the same 32-byte key from the shared secret. The key is never sent over the wire.
 
 ```mermaid
 flowchart LR
-    A["Shared Secret\n(e.g. 'mysecret')"]
-    B["SHA-256 Hash"]
-    C["32-byte XOR Key"]
-
-    A --> B --> C
+    A["Shared Secret"] --> B["SHA-256"] --> C["32-byte XOR Key"]
 
     style A fill:#1e293b,stroke:#475569,color:#e2e8f0
     style B fill:#312e81,stroke:#4338ca,color:#e2e8f0
@@ -36,93 +32,127 @@ flowchart LR
 
 ---
 
-### 2. XOR Encryption
+### 2. Frame Protocol
 
-Each byte of data is XORed against the key at a rolling offset. XOR is symmetric — the same operation encrypts and decrypts.
+Every WebSocket message starts with a **1-byte prefix** — no ambiguity between control and data frames.
 
 ```mermaid
 flowchart LR
-    A["Plain byte\n0x48 'H'"]
-    B["Key byte\n0xA3 at offset i"]
-    C["XOR ⊕"]
-    D["Encrypted byte\n0xEB"]
-    E["XOR ⊕"]
-    F["Plain byte\n0x48 'H'"]
+    A["0x00  PLAIN"]:::plain  --> D["Failed handshake ack only\n(client key was wrong — can't encrypt)"]
+    B["0x01  CTRL"]:::ctrl   --> E["Encrypted JSON\n{ type, ...payload }"]
+    C["0x02  CHUNK"]:::chunk --> F["Encrypted binary\n[4-byte offset][data]"]
 
-    A --> C
-    B --> C
-    C --> D
-    D --> E
-    B --> E
+    classDef plain fill:#7f1d1d,stroke:#991b1b,color:#fca5a5
+    classDef ctrl  fill:#312e81,stroke:#4338ca,color:#c7d2fe
+    classDef chunk fill:#14532d,stroke:#15803d,color:#86efac
+```
+
+---
+
+### 3. Connection & Handshake
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: WebSocket upgrade /ws
+    C->>S: 0x01 CTRL · { HANDSHAKE, token } encrypted
+    alt correct key
+        S-->>C: 0x01 CTRL · { HANDSHAKE_ACK, ok:true } encrypted
+        Note over C,S: All further traffic is encrypted
+    else wrong key
+        S-->>C: 0x00 PLAIN · { HANDSHAKE_ACK, ok:false }
+        S-->>C: close()
+        Note over C: Show "Invalid secret key" error
+    end
+```
+
+---
+
+### 4. Upload Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    participant D as Disk
+
+    loop For each file
+        C->>S: 0x01 CTRL · UPLOAD_FILE_START { path, size }
+        loop 64 KB chunks
+            C->>S: 0x02 CHUNK · [offset][encrypted data]
+        end
+        C->>S: 0x01 CTRL · UPLOAD_FILE_END
+        S->>D: flush writeStream
+        S-->>C: 0x01 CTRL · UPLOAD_FILE_ACK
+    end
+```
+
+---
+
+### 5. Download Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    participant D as Disk
+
+    C->>S: 0x01 CTRL · DOWNLOAD_FILE { path }
+    S->>D: createReadStream
+    S-->>C: 0x01 CTRL · DOWNLOAD_FILE_START { size }
+    loop 64 KB chunks
+        S-->>C: 0x02 CHUNK · [offset][encrypted data]
+    end
+    S-->>C: 0x01 CTRL · DOWNLOAD_FILE_END
+    C->>C: decrypt + merge chunks
+    C->>C: write to disk (File System Access API)
+```
+
+---
+
+### 6. Message Queue (no dropped frames)
+
+Incoming frames are buffered in a queue the moment they arrive. Consumers pull from it asynchronously — React re-renders never cause frames to be missed.
+
+```mermaid
+flowchart LR
+    A["WS onmessage\n(fires immediately)"]
+    B{"waiter\nwaiting?"}
+    C["resolve(frame)\ndirectly"]
+    D["push to\n_queue[]"]
+    E["nextFrame()\ncalled later"]
+    F["shift from\n_queue[]"]
+
+    A --> B
+    B -- yes --> C
+    B -- no  --> D
     E --> F
 
     style A fill:#1e293b,stroke:#475569,color:#e2e8f0
-    style B fill:#312e81,stroke:#4338ca,color:#e2e8f0
-    style C fill:#7c3aed,stroke:#6d28d9,color:#fff
-    style D fill:#7f1d1d,stroke:#991b1b,color:#e2e8f0
-    style E fill:#7c3aed,stroke:#6d28d9,color:#fff
+    style B fill:#7c3aed,stroke:#6d28d9,color:#fff
+    style C fill:#14532d,stroke:#15803d,color:#e2e8f0
+    style D fill:#312e81,stroke:#4338ca,color:#e2e8f0
+    style E fill:#1e293b,stroke:#475569,color:#e2e8f0
     style F fill:#14532d,stroke:#15803d,color:#e2e8f0
 ```
 
 ---
 
-### 3. Full Stream Flow (per file)
+### 7. Folder Structure Preservation
 
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant C as Client (React)
-    participant V as Vite Proxy
-    participant S as Server (Node)
-    participant D as Disk
-
-    U->>C: Select folder / files + enter secret
-    C->>C: SHA-256(secret) → 32-byte key
-
-    C->>V: WebSocket upgrade /ws
-    V->>S: Forward upgrade
-    S-->>C: Connection open
-
-    loop For each file
-        C->>C: Encrypt JSON metadata<br/>{"type":"file","path":"...","size":...}
-        C->>S: send() → encrypted binary blob
-
-        loop 64 KB chunks
-            C->>C: Read chunk from file.stream()
-            C->>C: XOR encrypt chunk (rolling offset)
-            C->>S: send() → encrypted binary blob
-        end
-
-        C->>C: Encrypt {"type":"end"}
-        C->>S: send() → encrypted binary blob
-
-        S->>S: Decrypt → detect "end"
-        S->>D: writeStream.end() → flush to disk
-        S->>C: send() → encrypted {"type":"ok","path":"..."}
-        C->>C: Decrypt ack → move to next file
-    end
-
-    C->>S: ws.close()
-    C->>U: ✅ Done
-```
-
----
-
-### 4. Folder Structure Preservation
-
-The browser's `webkitRelativePath` gives the full relative path of each file inside the selected folder. The server recreates the same tree on disk.
+`webkitRelativePath` carries the full relative path of each file. The server recreates the same tree on disk.
 
 ```mermaid
 flowchart TD
-    A["User selects folder:\nmy-project/"]
-
-    A --> B["src/index.ts\nwebkitRelativePath:\nmy-project/src/index.ts"]
-    A --> C["src/utils/helper.ts\nwebkitRelativePath:\nmy-project/src/utils/helper.ts"]
-    A --> D["package.json\nwebkitRelativePath:\nmy-project/package.json"]
-
-    B --> E["Server writes:\nreceived/my-project/src/index.ts"]
-    C --> F["Server writes:\nreceived/my-project/src/utils/helper.ts"]
-    D --> G["Server writes:\nreceived/my-project/package.json"]
+    A["User selects:\nmy-project/"]
+    A --> B["my-project/src/index.ts"]
+    A --> C["my-project/src/utils/helper.ts"]
+    A --> D["my-project/package.json"]
+    B --> E["received/my-project/src/index.ts"]
+    C --> F["received/my-project/src/utils/helper.ts"]
+    D --> G["received/my-project/package.json"]
 
     style A fill:#1e293b,stroke:#475569,color:#e2e8f0
     style B fill:#312e81,stroke:#4338ca,color:#e2e8f0
@@ -135,49 +165,52 @@ flowchart TD
 
 ---
 
-### 5. Message Protocol
+### 8. Download All — One Folder Picker
 
-Every frame sent over WebSocket is an encrypted binary blob — no plain text at any point.
+When downloading all files, the browser shows **one** folder picker. All files then save silently into the chosen folder with the original subfolder structure restored — no per-file save dialogs.
 
-```mermaid
-flowchart TD
-    A["WebSocket frame received"]
-    B["XOR decrypt with KEY at offset 0"]
-    C{"Valid JSON?\ntype = file or end?"}
-    D["Control: file\nOpen writeStream\nReset byteOffset"]
-    E["Control: end\nFlush writeStream\nSend encrypted ack"]
-    F["File chunk\nXOR decrypt at byteOffset\nWrite to stream\nbyteOffset += chunk.length"]
+| Browser | Behavior |
+| --- | --- |
+| Chrome / Edge 86+ | ✅ One folder picker → silent saves |
+| Safari 15.2+ | ✅ One folder picker → silent saves |
+| Firefox | ⚠ Falls back to per-file save dialog |
 
-    A --> B --> C
-    C -- Yes --> D & E
-    C -- No --> F
+---
 
-    style A fill:#1e293b,stroke:#475569,color:#e2e8f0
-    style B fill:#312e81,stroke:#4338ca,color:#e2e8f0
-    style C fill:#7c3aed,stroke:#6d28d9,color:#fff
-    style D fill:#14532d,stroke:#15803d,color:#e2e8f0
-    style E fill:#14532d,stroke:#15803d,color:#e2e8f0
-    style F fill:#7f1d1d,stroke:#991b1b,color:#e2e8f0
-```
+## Event Types
+
+| Type | Direction | Purpose |
+| --- | --- | --- |
+| `HANDSHAKE` | C → S | Initial auth with token |
+| `HANDSHAKE_ACK` | S → C | Auth result |
+| `LIST_FILES` | C → S | Request file list |
+| `FILES_LIST` | S → C | Array of relative paths |
+| `UPLOAD_FILE_START` | C → S | Begin file upload `{ path, size }` |
+| `UPLOAD_FILE_END` | C → S | File upload complete |
+| `UPLOAD_FILE_ACK` | S → C | Server confirmed save |
+| `DOWNLOAD_FILE` | C → S | Request a file `{ path }` |
+| `DOWNLOAD_FILE_START` | S → C | File incoming `{ size }` |
+| `DOWNLOAD_FILE_END` | S → C | File transfer complete |
+| `ERROR` | S → C | Error with `{ message }` |
 
 ---
 
 ## Project Structure
 
-```
+```text
 file-streamer/
 ├── client/
 │   ├── src/
-│   │   ├── App.tsx                    # UI — file picker, progress, status
+│   │   ├── App.tsx                    # UI — key gate, upload tab, download tab
 │   │   └── services/
-│   │       └── fileStreamService.ts   # Key derivation, XOR, WS streaming
+│   │       └── fileStreamService.ts   # Crypto, frame protocol, WS queue
 │   ├── vite.config.ts                 # Proxy /ws → localhost:3001
 │   └── package.json
 │
 └── server/
     ├── src/
-    │   └── index.ts                   # WS server, decrypt, write to disk
-    ├── received/                      # Streamed files land here
+    │   └── index.ts                   # WS server — handshake, upload, download
+    ├── received/                      # Uploaded files land here
     └── package.json
 ```
 
@@ -185,20 +218,62 @@ file-streamer/
 
 ## Running
 
+create .env files in `stream-clinet` & `stream-server` ( refer .env.sample )
+
 ```bash
-# 1. Start server
-cd server
-npm install
-SECRET=mysecret npx ts-node src/index.ts
+# Server
+cd stream-server
+pnpm install
+pnpm run dev
 
-# 2. Start client (separate terminal)
-cd client
-npm install
-npm run dev
+# Client
+cd stream-clinet
+pnpm install
+pnpm run dev
+# Open http://localhost:5173 — enter "mysecret" as the key
 
-# 3. Open http://localhost:5173
-#    Enter "mysecret" as the secret
-#    Select a folder or files → stream
+```
+
+### To Run in Production
+
+```bash
+# Build Client
+cd stream-clinet
+pnpm install
+pnpm run build
+
+
+# Build Server
+cd stream-server
+pnpm install
+pnpm run build
+pnpm run start
+```
+
+### To Run in Production Like ENV (Optional at your own risk)
+
+we can access this application from pulic network using tunneling (`localtunnel`)
+
+Steps:-
+example server is running on 3001 port locally
+
+```bash
+# one time
+pnpm add -g localtunnel
+
+## eanle tunneling for port
+lt --port 3001 # this gives htts URL ( copy the URL eg: https://warm-eels-occur.loca.lt)
+
+##  Build the clinet by passing localtunnel url in .env
+
+# stream-clinet/.env
+VITE_WS_URL=wss://warm-eels-occur.loca.lt # removed replaced https with wss
+
+
+# build the clinet, server then start server
+# then visit https://warm-eels-occur.loca.lt
+
+
 ```
 
 ---
@@ -206,9 +281,9 @@ npm run dev
 ## Security Notes
 
 | Property | Detail |
-|---|---|
-| Encryption | XOR with SHA-256 derived key — simple, not production-grade |
-| Key exchange | Never transmitted — both sides derive from shared secret |
-| Control frames | Also encrypted — no plain JSON visible on the wire |
-| Path traversal | Server strips `../` sequences before writing to disk |
+| --- | --- |
+| Encryption | XOR with SHA-256 key — simple, not production-grade |
+| Key exchange | Never transmitted — both sides derive independently |
+| All frames encrypted | Control messages, chunks, and acks — all XOR'd |
+| Path traversal | Server strips `../` before writing to disk |
 | Upgrade for production | Replace XOR with AES-256-GCM (`SubtleCrypto` / `crypto.createCipheriv`) |

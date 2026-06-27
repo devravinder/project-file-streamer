@@ -1,3 +1,5 @@
+const wsUrl = import.meta.env.VITE_WS_URL || `ws://${location.host}`;
+
 // ─── Event Types ─────────────────────────────────────────────────────────────
 export const EV = {
   HANDSHAKE:           "HANDSHAKE",
@@ -119,7 +121,7 @@ export async function connect(secret: string): Promise<void> {
   _queue   = [];
   _waiters = [];
 
-  const sock = new WebSocket(`ws://${location.host}/ws`);
+  const sock = new WebSocket(`${wsUrl}/ws`);
   sock.binaryType = "arraybuffer"; // ← arraybuffer, not blob — avoids async Blob.arrayBuffer()
 
   await new Promise<void>((resolve, reject) => {
