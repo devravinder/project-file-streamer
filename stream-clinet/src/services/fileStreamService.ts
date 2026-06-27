@@ -208,22 +208,46 @@ export async function listFiles(): Promise<string[]> {
   return res.files;
 }
 
-// ─── Download single file ─────────────────────────────────────────────────────
-export async function downloadFile(
+// ─── File System Access API helper ───────────────────────────────────────────
+// Gets (or creates) a nested file handle inside a root DirectoryHandle.
+// e.g. "job/cv/file.pdf" → root/job/cv/file.pdf
+async function getFileHandle(
+  root: FileSystemDirectoryHandle,
+  relativePath: string
+): Promise<FileSystemFileHandle> {
+  const parts = relativePath.replace(/\\/g, "/").split("/");
+  const fileName = parts.pop()!;
+  let dir = root;
+  for (const part of parts) {
+    dir = await dir.getDirectoryHandle(part, { create: true });
+  }
+  return dir.getFileHandle(fileName, { create: true });
+}
+
+// Write a Uint8Array directly to a FileSystemFileHandle (no save dialog)
+async function writeToDisk(
+  handle: FileSystemFileHandle,
+  data: Uint8Array
+): Promise<void> {
+  const writable = await handle.createWritable();
+  await writable.write(data as unknown as ArrayBuffer);
+  await writable.close();
+}
+
+// ─── Receive one file from server (shared by both download functions) ─────────
+async function receiveFile(
   filePath: string,
   onProgress?: (received: number, total: number) => void
-): Promise<void> {
+): Promise<Uint8Array> {
   sendCtrl({ type: EV.DOWNLOAD_FILE, path: filePath });
 
-  // Wait for START control frame
   const start = await nextCtrl<{ type: string; size: number }>();
-  if (start.type === EV.ERROR) throw new Error("File not found on server");
+  if (start.type === EV.ERROR) throw new Error(`File not found: ${filePath}`);
 
   const total  = start.size;
   const chunks: Uint8Array[] = [];
   let received = 0;
 
-  // Drain frames until DOWNLOAD_FILE_END
   while (true) {
     const buf    = await nextFrame();
     const prefix = new Uint8Array(buf)[0];
@@ -243,12 +267,15 @@ export async function downloadFile(
     }
   }
 
-  // Merge + save
   const merged = new Uint8Array(received);
   let pos = 0;
   for (const c of chunks) { merged.set(c, pos); pos += c.length; }
+  return merged;
+}
 
-  const blob = new Blob([merged]);
+// ─── Fallback: browser save dialog (single file, no FS Access API) ────────────
+function triggerBrowserSave(data: Uint8Array, filePath: string) {
+  const blob = new Blob([data as unknown as ArrayBuffer]);
   const url  = URL.createObjectURL(blob);
   const a    = Object.assign(document.createElement("a"), {
     href: url,
@@ -258,16 +285,47 @@ export async function downloadFile(
   URL.revokeObjectURL(url);
 }
 
-// ─── Download all files ───────────────────────────────────────────────────────
+// ─── Download single file ─────────────────────────────────────────────────────
+// For a single file we just trigger the browser save dialog (one dialog is fine).
+export async function downloadFile(
+  filePath: string,
+  onProgress?: (received: number, total: number) => void
+): Promise<void> {
+  const data = await receiveFile(filePath, onProgress);
+  triggerBrowserSave(data, filePath);
+}
+
+// ─── Download all files — one folder picker, then silent saves ────────────────
 export async function downloadAllFiles(
   onProgress: (filesDone: number, filesTotal: number, current: string, bytesReceived: number, bytesTotal: number) => void
 ): Promise<void> {
   const files = await listFiles();
-  for (let i = 0; i < files.length; i++) {
-    onProgress(i, files.length, files[i]!, 0, 0);
-    await downloadFile(files[i]!, (recv, total) =>
-      onProgress(i, files.length, files[i]!, recv, total)
-    );
+  if (files.length === 0) return;
+
+  // Ask user to pick a destination folder — ONE dialog for all files
+  let rootDir: FileSystemDirectoryHandle | null = null;
+  if ("showDirectoryPicker" in window) {
+    rootDir = await (window as Window & { showDirectoryPicker: () => Promise<FileSystemDirectoryHandle> })
+      .showDirectoryPicker();
   }
+
+  for (let i = 0; i < files.length; i++) {
+    const filePath = files[i]!;
+    onProgress(i, files.length, filePath, 0, 0);
+
+    const data = await receiveFile(filePath, (recv, total) =>
+      onProgress(i, files.length, filePath, recv, total)
+    );
+
+    if (rootDir) {
+      // Save directly into chosen folder, recreating subfolder structure — no dialog
+      const handle = await getFileHandle(rootDir, filePath);
+      await writeToDisk(handle, data);
+    } else {
+      // Fallback for browsers without File System Access API (Firefox)
+      triggerBrowserSave(data, filePath);
+    }
+  }
+
   onProgress(files.length, files.length, "", 0, 0);
 }
