@@ -7,7 +7,7 @@ Stream files from browser to server (and back) over WebSocket — fully encrypte
 ## Stack
 
 | Side | Tech |
-|---|---|
+| --- | --- |
 | Client | React + TypeScript (Vite) |
 | Server | Node.js + TypeScript (`ws`) |
 | Transport | WebSocket only |
@@ -170,7 +170,7 @@ flowchart TD
 When downloading all files, the browser shows **one** folder picker. All files then save silently into the chosen folder with the original subfolder structure restored — no per-file save dialogs.
 
 | Browser | Behavior |
-|---|---|
+| --- | --- |
 | Chrome / Edge 86+ | ✅ One folder picker → silent saves |
 | Safari 15.2+ | ✅ One folder picker → silent saves |
 | Firefox | ⚠ Falls back to per-file save dialog |
@@ -180,7 +180,7 @@ When downloading all files, the browser shows **one** folder picker. All files t
 ## Event Types
 
 | Type | Direction | Purpose |
-|---|---|---|
+| --- | --- | --- |
 | `HANDSHAKE` | C → S | Initial auth with token |
 | `HANDSHAKE_ACK` | S → C | Auth result |
 | `LIST_FILES` | C → S | Request file list |
@@ -197,7 +197,7 @@ When downloading all files, the browser shows **one** folder picker. All files t
 
 ## Project Structure
 
-```
+```text
 file-streamer/
 ├── client/
 │   ├── src/
@@ -218,16 +218,18 @@ file-streamer/
 
 ## Running
 
+crate a `.env` file under `stream-server` add env variables ( refer `.env.sample` )
+
 ```bash
 # Server
-cd server
-npm install
-SECRET=mysecret npx ts-node src/index.ts
+cd stream-server
+pnpm install
+pnpm run dev
 
 # Client
-cd client
-npm install
-npm run dev
+cd stream-client
+pnpm install
+pnpm run dev
 # Open http://localhost:5173 — enter "mysecret" as the key
 ```
 
@@ -236,7 +238,7 @@ npm run dev
 ## Security Notes
 
 | Property | Detail |
-|---|---|
+| --- | --- |
 | Encryption | XOR with SHA-256 key — simple, not production-grade |
 | Key exchange | Never transmitted — both sides derive independently |
 | All frames encrypted | Control messages, chunks, and acks — all XOR'd |
